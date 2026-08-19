@@ -1,0 +1,16 @@
+{
+  "name": "pi-plan-wizard",
+  "description": "Plan and implement projects. Use /plan to create plans, /implement to execute them with step tracking, blocked-step handling, and auto-compaction.",
+  "version": "2.0.0",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
