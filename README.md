@@ -82,12 +82,12 @@ Legacy plans written with `### Step N:` headings are still understood (the statu
 
 ## Implementation flow (`/implement` — the Ralph loop)
 
-`/implement` is **code-driven, not model-driven**: a TypeScript state machine transitions the model between phases, switches models, and compacts context at every boundary. This is what makes it robust for small local models that would otherwise lose the plan or fill their context.
+`/implement` is **code-driven, not model-driven**: a TypeScript state machine transitions the model between phases, switches models, and opens a *fresh* pi session at every boundary. This is what keeps each phase's context tiny and isolated — no compaction of a prior phase's transcript is ever fed to the next phase.
 
-The state machine cycles, **one step at a time**:
+The state machine cycles, **one step at a time**, and each phase runs in its **own fresh session** (implement → verify → fix → next):
 
 ```
-IMPLEMENT step N  ──▶ compact ──▶ VERIFY (different model, runs the step's "Verification")
+IMPLEMENT step N  ──▶ fresh session ──▶ VERIFY (a DIFFERENT model, clean context, runs the step's "Verification")
                                             │
                      ┌───────────────────────┴───────────────────────┐
                  PASS ✓                                          FAIL ✗
@@ -102,7 +102,7 @@ IMPLEMENT step N  ──▶ compact ──▶ VERIFY (different model, runs the 
 ```
 
 1. **Implement** — the implementer model does *only* the current step, then stops.
-2. **Compact** — the context is aggressively compacted (see *Context management* below).
+2. **Fresh session for the next phase** — the loop opens a *new* pi session so the next phase (especially the verifier) sees a genuinely clean context, never a compressed version of the previous phase's work. See *Context management* below.
 3. **Verify** — a *different* model (the verifier) reads what was written and judges it against the step's `**Verification:**` criteria. It must call the `submit_verification` tool with a verdict.
 4. **Branch on the verdict:**
    - **PASS** → the checkbox flips to `[x]`, the verifier's `carryForwardNotes` are stored for the next step, and the loop moves to the *implement* phase of step N+1.
@@ -128,11 +128,12 @@ Because the note is carried forward, each step's implementer only needs the *cur
 
 ## Context management (the whole point)
 
-Small local models fill their context fast, so the loop keeps each phase's context **small on purpose**:
+Small local models fill their context fast, so the loop gives every phase its **own tiny, isolated context**:
 
-- **Aggressive compaction** — `ctx.compact()` runs at *every* phase boundary, with custom instructions that preserve only the essentials (plan title, current phase, current step, the verification, and the carry-forward note) and drop everything else.
-- **Minimal per-phase prompts** — each phase gets a tight prompt (implement / verify / fix), not the whole plan.
-- **Carry-forward notes** — cross-step knowledge is distilled into a <40-word note, not the entire prior history.
+- **Fresh session per phase** — every phase transition opens a *new* pi session (via the internal `/pw-next` command). The verifier never sees any implementer turns — it takes a genuinely fresh look at the code. There is **no per-phase compaction**.
+- **Minimal per-phase prompts** — each phase gets a tight prompt (implement / verify / fix) built from the current phase plus the shared notes — not the whole plan.
+- **Shared notes scratchpad** — `.pi/implement/<plan>.notes.md` is an append-only design log. Both implementer and verifier append decisions with the `append_plan_note` tool, the loop auto-annotates progress, and its full contents are inlined into every phase prompt.
+- **Carry-forward notes** — the verifier's short (<40-word) note for the next step is also folded into the notes file.
 - **Per-phase model switching** — the loop calls `setModel()` to switch between the implementer and the verifier (and to fix, back to the implementer) as it transitions phases.
 
 ---
@@ -141,11 +142,11 @@ Small local models fill their context fast, so the loop keeps each phase's conte
 
 | command | what it does |
 |---|---|
-| `/implement <plan_file>` | start the loop on a saved plan |
+| `/implement <plan_file>` | start the loop on a saved plan — **auto-resumes** any existing incomplete state for that plan (picking up at the last completed step), or starts fresh if none exists |
 | `/implement --resume` | resume the most recent *incomplete* loop (a stopped or interrupted one) — it switches back to the correct phase model and continues from where it left off |
 | `/implement-stop` | pause the active loop. The state is written so you can resume later with `/implement --resume` |
 
-The loop state **survives compaction and crashes**, so you can stop it, close pi, and resume in a fresh session.
+The loop state **survives session hops and crashes**, so you can stop it, close pi, and resume in a fresh session. Re-running `/implement` on the same plan also resumes from the last checked-off step instead of restarting from step 1 — per-step status is reconciled against the checkboxes in the plan file, so you can even uncheck a box in the plan to redo just that step.
 
 ---
 
@@ -155,6 +156,7 @@ The loop state **survives compaction and crashes**, so you can stop it, close pi
 |---|---|
 | `.pi/plans/<name>.md` | the RALPH-format plan (output of `/plan`) |
 | `.pi/implement/<name>.json` | the loop state for a plan (current phase, step, per-step status/retries/verdict/carry-forward notes) — the source of truth for the running loop |
+| `.pi/implement/<name>.notes.md` | append-only shared notes scratchpad for the loop — agents append design decisions, the loop annotates progress, and its contents are inlined into every phase prompt |
 | `.pi/plan-wizard.json` | settings (see below) |
 
 All under the project root; gitignoring `.pi/` keeps your repo clean.
@@ -185,9 +187,11 @@ A pi extension that registers:
 | `on("before_agent_start")` | injects planning instructions before each LLM call (plan mode only) |
 | `registerTool("present_plan")` | full-screen editor for plan approve/edit/cancel |
 | `registerTool("submit_verification")` | the verifier's verdict channel (pass/issues/fixes/carry-forward) |
-| `on("agent_settled")` | **the Ralph driver** — advances the loop: implement → verify → fix → next step, switching models and compacting at each boundary |
-| `on("session_start")` | surfaces an incomplete/stopped loop so you know to run `/implement --resume` |
-| `setModel` / `compact` | per-phase model switching and aggressive context compaction |
+| `registerTool("append_plan_note")` | lets any phase append a decision to the shared notes scratchpad |
+| `on("agent_settled")` | **the Ralph driver** — persists the next phase and queues `/pw-next` (implement → verify → fix → next step) |
+| `on("session_start")` | rehydrates the loop from disk and dispatches a fresh phase's prompt (model switch + notes-aware prompt) in its clean session |
+| `registerCommand("pw-next")` | (internal) opens the fresh session for the next phase |
+| `setModel` / `newSession` | per-phase model switching and fresh-session context isolation |
 
 ---
 

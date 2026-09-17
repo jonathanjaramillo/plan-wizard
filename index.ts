@@ -7,25 +7,30 @@
  *                          and an optional per-step "Verify with:" model override).
  *   /implement [plan]     — runs the plan as a code-driven state machine:
  *                            implement step N (implement model)
- *                              -> [compact]
+ *                              -> [fresh session]
  *                              -> verify step N (verifier model, a DIFFERENT model)
- *                              -> [compact]
+ *                              -> [fresh session]
  *                              -> if PASS: check the box, store carry-forward notes,
- *                                 [compact], advance to step N+1
- *                                 if FAIL: [compact], fix (implement model) -> verify again
+ *                                 [fresh session], advance to step N+1
+ *                                 if FAIL: [fresh session], fix (implement model) -> verify again
  *                                     (up to maxVerifyRetries; exceeded => mark
  *                                      BLOCKED and continue to the next step)
  *
- * Designed for SMALL LOCAL MODELS with tiny context windows: every phase gets a
- * fresh, minimal prompt, the context is compacted at every phase boundary, and a
- * tiny "carry-forward notes" field bridges context between phases so the model
- * never has to hold the full conversation.
+ * Designed for SMALL LOCAL MODELS with tiny context windows: every phase runs in
+ * its OWN fresh pi session (phase transitions create a new session via the internal
+ * `/pw-next` command), so no phase ever sees another phase's turns — the verifier
+ * takes a genuinely fresh look at the code. There is NO per-phase compaction.
+ * Cross-phase memory is carried by an append-only notes scratchpad at
+ * `.pi/implement/<plan>.notes.md` (agents append via `append_plan_note`, the loop
+ * auto-annotates progress) which is inlined into every phase prompt, plus the tiny
+ * "carry-forward notes" field that bridges the immediate next step.
  *
- * State (survives compaction / crashes) lives in .pi/implement/<plan>.json.
+ * State (survives session hops / crashes) lives in .pi/implement/<plan>.json.
+ *
  * Settings live in .pi/plan-wizard.json.
  */
 
-import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, type AnyToolDefinition, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 // The model type is provided by pi-ai via ExtensionContext["model"] — we derive
 // it from there instead of importing pi-ai directly, because pi-ai is not always
 // resolvable from the plugin's own location (it only lives nested under pi-coding-agent).
@@ -72,6 +77,7 @@ interface RalphState {
 	verifierModel: string; // "provider/id" (global default)
 	maxVerifyRetries: number;
 	stopped: boolean; // set by /implement-stop; a marker only — /implement --resume can still resume it
+	pendingPrompt: boolean; // a fresh session should dispatch this phase's prompt immediately on session_start
 	steps: RalphStep[];
 }
 
@@ -90,7 +96,7 @@ let loopInFlight = false; // guards the agent_settled loop against re-entrancy
 let loopPaused = false; // user pressed /implement-stop
 
 // ---- Live ExtensionAPI reference -------------------------------------------
-// Module-level helpers (goToPhase, startRalphLoop) run OUTSIDE the extension
+// Module-level helpers (kickLoopSession, startRalphLoop) run OUTSIDE the extension
 // entry, so they cannot capture `pi` as a closure variable. They reach the
 // live ExtensionAPI through P(), which is assigned from the entry's `pi` below.
 let __pi: ExtensionAPI | undefined;
@@ -124,6 +130,43 @@ function getStatePath(cwd: string, planFile: string): string {
 	const base = path.basename(planFile);
 	const name = base.replace(/\.md$/i, ".json");
 	return path.join(getImplementDir(cwd), name);
+}
+
+/**
+ * Notes scratchpad for a given plan, e.g. <plan>.md -> <plan>.notes.md (shares the JSON state's stem).
+ */
+function getNotesPath(cwd: string, planFile: string): string {
+	const base = path.basename(planFile);
+	const name = base.replace(/\.md$/i, ".notes.md");
+	return path.join(getImplementDir(cwd), name);
+}
+
+/** Read the full notes scratchpad, or "" if it doesn't exist yet. */
+async function readNotes(cwd: string, planFile: string): Promise<string> {
+	try {
+		return await fs.promises.readFile(getNotesPath(cwd, planFile), "utf-8");
+	} catch {
+		return "";
+	}
+}
+
+/**
+ * Append a step-tagged markdown block to the notes scratchpad (creates file + dir if needed).
+ * `heading` is like "Step 2 implement" or "_loop_ Step 2 verify"; `body` is free text (usually bullets).
+ */
+async function appendNote(cwd: string, planFile: string, heading: string, body: string): Promise<void> {
+	const p = getNotesPath(cwd, planFile);
+	await fs.promises.mkdir(path.dirname(p), { recursive: true });
+	const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+	const text = `\n### ${heading} — ${stamp}\n${body.trimEnd()}\n`;
+	await fs.promises.writeFile(p, text, { flag: "a", encoding: "utf-8" });
+}
+
+/** (Re)write the scratchpad with just a header, starting a brand-new run of the loop. */
+async function resetNotes(cwd: string, planFile: string, planTitle: string): Promise<void> {
+	const p = getNotesPath(cwd, planFile);
+	await fs.promises.mkdir(path.dirname(p), { recursive: true });
+	await fs.promises.writeFile(p, `# Implementation notes — ${planTitle}\n\n(append-only scratchpad; the loop inlines its full contents into every phase prompt.)\n`, "utf-8");
 }
 
 /* ─────────────────────────────────────────────────────
@@ -166,6 +209,38 @@ async function writeRalphState(state: RalphState): Promise<void> {
 	const filePath = getStatePath(state.cwd, state.planFile);
 	await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
 	await fs.promises.writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
+}
+
+/**
+ * Find the most recent persisted loop state still in flight (not done / stopped).
+ * Used to re-hydrate the loop after a session hop (module globals reset) and by
+ * `/pw-next` and `session_start`.
+ */
+async function findActiveState(cwd: string): Promise<RalphState | null> {
+	const dir = getImplementDir(cwd);
+	try {
+		const entries = await fs.promises.readdir(dir);
+		let latest: RalphState | null = null;
+		let latestMtime = 0;
+		for (const e of entries) {
+			if (!e.endsWith(".json")) continue;
+			const p = path.join(dir, e);
+			try {
+				const c = await fs.promises.readFile(p, "utf-8");
+				const s = JSON.parse(c) as RalphState;
+				if (!s || !Array.isArray(s.steps)) continue;
+				if (s.phase === "done" || s.phase === "stopped") continue;
+				const st = await fs.promises.stat(p);
+				if (st.mtimeMs > latestMtime) {
+					latestMtime = st.mtimeMs;
+					latest = s;
+				}
+			} catch { /* ignore */ }
+		}
+		return latest;
+	} catch {
+		return null;
+	}
 }
 
 /* ─────────────────────────────────────────────────────
@@ -487,7 +562,15 @@ function buildPlanInstructions(description: string): string {
  * The prompt handed to the IMPLEMENT model for one step. Deliberately minimal:
  * only the current step + carry-forward note from the previous step.
  */
-function buildImplementPrompt(state: RalphState, step: RalphStep): string {
+
+/** Render the live notes-scratchpad section for a phase prompt (empty array when there are no notes yet). */
+function sharedNotesSection(notes: string): string[] {
+	const trimmed = (notes ?? "").trim();
+	if (!trimmed) return [];
+	return ["## Shared design notes (accumulated from prior implement/verify/fix phases)", trimmed, ""];
+}
+
+function buildImplementPrompt(state: RalphState, step: RalphStep, notes: string): string {
 	const prev = state.steps[step.index - 1];
 	const carryForward = prev?.memory || "";
 	return [
@@ -501,6 +584,7 @@ function buildImplementPrompt(state: RalphState, step: RalphStep): string {
 		"## Carry-forward note from the previous step",
 		carryForward ? carryForward : "(this is the first step — no prior context)",
 		"",
+		...sharedNotesSection(notes),
 		"## Guidance",
 		"- Read the relevant files first, then write/edit the code to satisfy THIS step.",
 		"- Keep changes minimal and focused on this step.",
@@ -513,7 +597,7 @@ function buildImplementPrompt(state: RalphState, step: RalphStep): string {
  * The prompt handed to the VERIFIER model. It is an INDEPENDENT reviewer that may
  * be a different model than the implementer.
  */
-function buildVerifyPrompt(state: RalphState, step: RalphStep, isReverify: boolean): string {
+function buildVerifyPrompt(state: RalphState, step: RalphStep, isReverify: boolean, notes: string): string {
 	return [
 		`[RALPH VERIFY · step ${step.index + 1}/${state.steps.length} of "${state.planTitle}"]${isReverify ? " (re-verification)" : ""}`,
 		"",
@@ -525,6 +609,7 @@ function buildVerifyPrompt(state: RalphState, step: RalphStep, isReverify: boole
 		"## Verification criteria",
 		step.verification || "(No explicit criteria were given. Use your best judgment: confirm the step's description is fully and correctly satisfied, the code compiles/runs, and there are no obvious bugs)",
 		"",
+		...sharedNotesSection(notes),
 		"## How to verify",
 		"- Read the relevant files. If the criteria mention a command or test, run it (you have bash/read/grep).",
 		"- Be strict and specific: a vague 'looks fine' is not acceptable — cite what you checked.",
@@ -539,7 +624,7 @@ function buildVerifyPrompt(state: RalphState, step: RalphStep, isReverify: boole
 /**
  * The prompt handed to the IMPLEMENT model to FIX a step the verifier rejected.
  */
-function buildFixPrompt(state: RalphState, step: RalphStep): string {
+function buildFixPrompt(state: RalphState, step: RalphStep, notes: string): string {
 	const v = step.lastVerdict;
 	const issues = v?.issues ?? [];
 	const fixes = v?.fixes ?? [];
@@ -565,6 +650,9 @@ function buildFixPrompt(state: RalphState, step: RalphStep): string {
 	if (v?.notes) {
 		out.push(`## Verifier's carry-forward note`, v.notes, "");
 	}
+	if (notes && notes.trim()) {
+		out.push("## Shared design notes (accumulated from prior implement/verify/fix phases)", notes.trim(), "");
+	}
 	out.push(
 		"## Guidance",
 		"- Fix ONLY the flagged issues. Do not touch other steps.",
@@ -575,39 +663,6 @@ function buildFixPrompt(state: RalphState, step: RalphStep): string {
 	return out.join("\n");
 }
 
-/**
- * Custom instructions for ctx.compact() at a phase boundary. Told to keep ONLY
- * the essentials so a small local model's context stays minimal.
- */
-function buildCompactionInstructions(phase: Phase, state: RalphState, step: RalphStep | undefined): string {
-	const stepNum = step ? step.index + 1 : "?";
-	const lines: string[] = [
-		`This is the Ralph implementation loop for plan "${state.planTitle}". The context is intentionally compacted aggressively to fit a small local model.`,
-		`Preserve ONLY the essentials below. Drop or heavily summarize everything else.`,
-		"",
-		`Preserve:`,
-		`  - Plan title: ${state.planTitle}`,
-		`  - Current phase: ${phase}`,
-		`  - Current step: ${stepNum}`,
-		`  - Current step title: ${step ? step.title : "(n/a)"}`,
-	];
-	if (phase === "implement" && step) {
-		const prev = state.steps[step.index - 1];
-		lines.push(`  - Carry-forward note from previous step: ${prev?.memory || "(first step)"}`);
-		lines.push(`  - This step's goal: ${step.description}`);
-	}
-	if (phase === "verify" && step) {
-		lines.push(`  - Verification criteria: ${step.verification || "(best judgment)"}`);
-		lines.push(`  - Carry-forward note so far: ${step.memory || "(none yet)"}`);
-	}
-	if (phase === "fix" && step && step.lastVerdict) {
-		const v = step.lastVerdict;
-		lines.push(`  - Issues to fix: ${(v.issues ?? []).join("; ") || "(none listed)"}`);
-		lines.push(`  - Suggested fixes: ${(v.fixes ?? []).join("; ") || "(use judgment)"}`);
-	}
-	lines.push("", "The next phase's full prompt is sent right after this compaction — do not try to re-derive or expand it here.");
-	return lines.join("\n");
-}
 
 /* ─────────────────────────────────────────────────────
    Progress UI
@@ -665,6 +720,52 @@ function updateProgress(ctx: ExtensionContext): void {
    present_plan tool schema
    ───────────────────────────────────────────────────── */
 
+/* ─────────────────────────────────────────────────────
+   Lazy tool registration
+   ─────────────────────────────────────────────────────
+   The three tools below (present_plan, submit_verification,
+   append_plan_note) are only meaningful inside a /plan or /implement
+   run. We register them at extension load AND at every session_start,
+   but immediately drop them from the ACTIVE set via pi.setActiveTools(),
+   so they neither appear in the system prompt nor are callable by the
+   LLM. When /plan or /implement runs we call ensureOwnToolsActive(),
+   which registers (idempotently) and adds them back to the active set. */
+
+// Tool definitions (registered lazily — see registerLazyTools() and the
+// session_start handler in the extension entry below).
+const lazyToolDefs: AnyToolDefinition[] = [];
+function addLazyTool(def: AnyToolDefinition): void {
+	lazyToolDefs.push(def);
+}
+function registerLazyTools(): void {
+	for (const def of lazyToolDefs) {
+		if (P().getAllTools().some((t) => t.name === def.name)) continue;
+		P().registerTool(def);
+	}
+}
+function deactivateOwnTools(): void {
+	const active = P().getActiveTools();
+	const kept = active.filter((n) => !lazyToolDefs.some((d) => d.name === n));
+	if (kept.length !== active.length) P().setActiveTools(kept);
+}
+function reactivateOwnTools(): void {
+	const active = new Set(P().getActiveTools());
+	for (const def of lazyToolDefs) active.add(def.name);
+	P().setActiveTools([...active]);
+}
+
+/**
+ * Register our tools (idempotent) and add them to the active set.
+ * Call this at every point where a /plan or /implement workflow is
+ * starting — the command handler, the fresh-run path of startRalphLoop,
+ * the resume path, and the /pw-next phase-advance handler.
+ */
+function ensureOwnToolsActive(): void {
+	registerLazyTools();
+	reactivateOwnTools();
+}
+
+
 const presentPlanSchema = Type.Object({
 	plan: Type.String({ description: "Full markdown text of the plan (in RALPH FORMAT) to review and approve" }),
 });
@@ -688,40 +789,38 @@ const submitVerificationSchema = Type.Object({
 });
 type SubmitVerificationParams = Static<typeof submitVerificationSchema>;
 
+const appendPlanNoteSchema = Type.Object({
+	text: Type.String({ description: "The note text (one or more lines; markdown bullets are fine)." }),
+	step: Type.Optional(Type.Integer({ description: "Optional 1-based step number to tag the note with. Defaults to the current step." })),
+});
+type AppendPlanNoteParams = Static<typeof appendPlanNoteSchema>;
+
 /* ─────────────────────────────────────────────────────
    The Ralph loop (code-driven state machine)
    ─────────────────────────────────────────────────────
    Driven by the `agent_settled` event. Each phase is exactly one agent run;
-   the loop transitions phase -> compact -> next phase, switching models and
-   sending a fresh, minimal prompt for each phase.
+   every phase transition moves to a FRESH pi session (no per-phase compaction),
+   switching models and sending a fresh, minimal prompt built from the persisted
+   state plus the append-only notes scratchpad.
    ───────────────────────────────────────────────────── */
 
 /**
- * After a phase's run settles, move to the next phase:
- *  1. switch the active model (pi.setModel),
- *  2. compact the context,
- *  3. (on compact complete) send the next phase's minimal prompt,
- *  4. release the re-entrancy guard.
- *
- * The actual transition + prompt is produced by `nextPromptFor`.
+ * After a phase's run settles we do NOT dispatch here — the fresh-session-per-phase
+ * loop needs session replacement (`ctx.newSession`), which is command-context-only.
+ * So `advanceLoop` only mutates + persists state, marks `pendingPrompt`, and queues
+ * the internal `/pw-next` command. That command opens the fresh session, and the new
+ * session's `session_start` does the real dispatch (model switch + phase prompt with
+ * the notes file inlined). This keeps every phase's context genuinely isolated.
  */
-async function goToPhase(ctx: ExtensionContext, phase: Phase): Promise<void> {
-	const state = ralphState;
-	if (!state) {
-		loopInFlight = false;
-		return;
-	}
-	state.phase = phase;
-	const step = state.steps[state.currentStep];
 
-	// 1. Choose the model for this phase.
+/** Switch to the model that should run a phase (verify vs implement). */
+async function selectModelForPhase(ctx: ExtensionContext, phase: Phase, state: RalphState): Promise<void> {
 	let modelQuery: string | null = null;
 	if (phase === "verify") {
 		const s = state.steps[state.currentStep];
 		modelQuery = s?.verifyWith || state.verifierModel;
 	} else {
-		// implement or fix always uses the implement model
-		modelQuery = state.implementModel;
+		modelQuery = state.implementModel; // implement and fix always use the implement model
 	}
 	const targetModel = findModelByQuery(ctx, modelQuery);
 	if (targetModel && targetModel !== ctx.model) {
@@ -730,57 +829,63 @@ async function goToPhase(ctx: ExtensionContext, phase: Phase): Promise<void> {
 			ctx.ui.notify(`Could not switch to ${modelQuery || "(default)"}. Continuing with current model.`, "warning");
 		}
 	}
-
-	// 2 + 3. Compact, then (on complete) send the next prompt and release the guard.
-	const compactionMsg = buildCompactionInstructions(phase, state, step);
-	const nextPrompt = buildNextPrompt(phase, state, step);
-	let fired = false;
-	const fireNext = () => {
-		if (fired) return;
-		fired = true;
-		loopInFlight = false;
-		try {
-			P().sendUserMessage(nextPrompt);
-			updateProgress(ctx);
-		} catch (e) {
-			ctx.ui.notify(`Failed to send ${phase} prompt: ${(e as Error).message}`, "error");
-		}
-	};
-	try {
-		ctx.compact({
-			customInstructions: compactionMsg,
-			onComplete: () => fireNext(),
-			onError: (err) => {
-				ctx.ui.notify(`Compaction failed: ${err.message}. Continuing without compaction.`, "warning");
-				fireNext();
-			},
-		});
-	} catch (e) {
-		ctx.ui.notify(`Compaction error: ${(e as Error).message}. Continuing.`, "warning");
-		fireNext();
-	}
 }
 
-function buildNextPrompt(phase: Phase, state: RalphState, step: RalphStep | undefined): string {
+/** Build the phase prompt for the current step, inlining the LIVE notes file. */
+async function buildPhasePrompt(state: RalphState, phase: Phase): Promise<string> {
+	const step = state.steps[state.currentStep];
+	const notes = await readNotes(state.cwd, state.planFile);
 	switch (phase) {
 		case "implement":
-			return step ? buildImplementPrompt(state, step) : "Implementation complete.";
+			return step ? buildImplementPrompt(state, step, notes) : "Implementation complete.";
 		case "verify": {
 			const s = state.steps[state.currentStep];
-			return s ? buildVerifyPrompt(state, s, s.noVerdictRetries > 0 || s.retries > 0) : "Nothing to verify.";
+			return s ? buildVerifyPrompt(state, s, s.noVerdictRetries > 0 || s.retries > 0, notes) : "Nothing to verify.";
 		}
 		case "fix": {
 			const s = state.steps[state.currentStep];
-			return s ? buildFixPrompt(state, s) : "Nothing to fix.";
+			return s ? buildFixPrompt(state, s, notes) : "Nothing to fix.";
 		}
 		default:
 			return "Implementation complete.";
 	}
 }
 
+/** Auto-append a progress marker to the notes scratchpad at each phase boundary. */
+async function appendAutoProgressNote(state: RalphState, message: string): Promise<void> {
+	const step = state.steps[state.currentStep];
+	const stepNum = step ? step.index + 1 : "?";
+	await appendNote(state.cwd, state.planFile, `_loop_ Step ${stepNum} ${state.phase}`, message);
+}
+
 /**
- * Decide and execute the transition from the CURRENT (just-finished) phase to the
- * next. Invoked from the agent_settled handler.
+ * Persist `pendingPrompt` and queue `/pw-next` so a fresh session runs the next phase
+ * with a clean context. Falls back to an inline dispatch (same session) if queuing fails.
+ */
+async function dispatchToNextPhase(ctx: ExtensionContext, state: RalphState): Promise<void> {
+	state.pendingPrompt = true;
+	await writeRalphState(state);
+	loopInFlight = false;
+	try {
+		// expandPromptTemplates MUST be true: sendUserMessage defaults it to false, in which case
+		// "command dispatch" is skipped and "/pw-next" would be sent to the LLM as plain
+		// text instead of running the handler that opens the fresh phase session.
+		P().sendUserMessage("/pw-next", { expandPromptTemplates: true });
+	} catch (e) {
+		ctx.ui.notify(`Failed to queue loop transition: ${(e as Error).message}. Dispatching here instead.`, "error");
+		await selectModelForPhase(ctx, state.phase, state);
+		const prompt = await buildPhasePrompt(state, state.phase);
+		state.pendingPrompt = false;
+		await writeRalphState(state);
+		P().sendUserMessage(prompt);
+	}
+}
+
+/**
+ * Decide the transition from the CURRENT (just-finished) phase to the next one,
+ * persist it, and queue the fresh-session hop. Invoked from `agent_settled`.
+ * There is no compact() anywhere — context isolation comes from fresh sessions + the
+ * notes file, not from compressing the previous phase's transcript into the next.
  */
 async function advanceLoop(ctx: ExtensionContext): Promise<void> {
 	const state = ralphState;
@@ -788,35 +893,32 @@ async function advanceLoop(ctx: ExtensionContext): Promise<void> {
 		loopInFlight = false;
 		return;
 	}
+	if (state.stopped) { finishLoop(ctx, "stopped"); return; }
+
+	let next: Phase | null = null;
 
 	switch (state.phase) {
-		// ── Implement phase just finished -> Verify ──
-		case "implement": {
-			const step = state.steps[state.currentStep];
-			await goToPhase(ctx, "verify");
-			// verify uses the same step
-			void step;
-			return;
-		}
+		// ── implement / fix just finished -> verify (same step) ──
+		case "implement":
+		case "fix":
+			await appendAutoProgressNote(state, `finished — moving to a fresh-session verify.`);
+			next = "verify";
+			break;
 
-		// ── Fix phase just finished -> re-Verify ──
-		case "fix": {
-			await goToPhase(ctx, "verify");
-			return;
-		}
-
-		// ── Verify phase just finished -> branch on the verdict ──
+		// ── verify just finished -> branch on the verdict ──
 		case "verify": {
 			const step = state.steps[state.currentStep];
+			if (!step) { finishLoop(ctx, "done"); return; }
+
 			if (!step.lastVerdict) {
 				// Verifier finished without calling submit_verification. Re-verify up to
-				// (maxVerifyRetries) times; then treat as a failure and go to fix.
+				// (maxVerifyRetries) times, then treat as a failure and go to fix.
 				if (step.noVerdictRetries < state.maxVerifyRetries) {
 					step.noVerdictRetries += 1;
 					await writeRalphState(state);
-					ctx.ui.notify("Verifier did not submit a verdict. Re-verifying…", "info");
-					await goToPhase(ctx, "verify");
-					return;
+					ctx.ui.notify("Verifier did not submit a verdict. Re-verifying in a fresh session…", "info");
+					next = "verify";
+					break;
 				}
 				// Give up: synthesize a failure verdict so the loop can continue.
 				step.lastVerdict = {
@@ -834,10 +936,24 @@ async function advanceLoop(ctx: ExtensionContext): Promise<void> {
 				step.status = "pass";
 				step.memory = verdict.notes || step.memory;
 				await setStepCheckbox(ctx.cwd, state.planFile, step.index, "x");
-				await writeRalphState(state);
+				await appendAutoProgressNote(state, `PASS ✅ — "${step.title}".`);
 				ctx.ui.notify(`Step ${step.index + 1} "${step.title}" — PASS ✅`, "success");
-				await nextStepOrFinish(ctx);
-				return;
+				const nextIndex = step.index + 1;
+				if (nextIndex >= state.steps.length) {
+					// 🏁 All steps done.
+					const pass = state.steps.filter((s) => s.status === "pass").length;
+					const blocked = state.steps.filter((s) => s.status === "blocked").length;
+					const skipped = state.steps.filter((s) => s.status === "skipped").length;
+					state.phase = "done";
+					await writeRalphState(state);
+					finishLoop(ctx, "done");
+					ctx.ui.notify(`Plan "${state.planTitle}" complete — ${pass} passed, ${blocked} blocked, ${skipped} skipped.`, "success");
+					return; // no fresh session after the final step
+				}
+				state.currentStep = nextIndex;
+				state.steps[nextIndex].status = "in_progress";
+				next = "implement";
+				break;
 			}
 
 			// ❌ FAIL — retry up to maxVerifyRetries, else mark blocked and continue.
@@ -848,15 +964,27 @@ async function advanceLoop(ctx: ExtensionContext): Promise<void> {
 				// Exceeded retries: mark BLOCKED (checkbox -> B) and continue to the next step.
 				step.status = "blocked";
 				await setStepCheckbox(ctx.cwd, state.planFile, step.index, "B");
-				await writeRalphState(state);
+				await appendAutoProgressNote(state, `BLOCKED after ${step.retries} attempts — continuing to next step.`);
 				ctx.ui.notify(`Step ${step.index + 1} "${step.title}" — FAILED after ${step.retries} attempts; marked BLOCKED. Continuing to the next step.`, "error");
-				await nextStepOrFinish(ctx);
-				return;
+				const nextIndex = step.index + 1;
+				if (nextIndex >= state.steps.length) {
+					const pass = state.steps.filter((s) => s.status === "pass").length;
+					state.phase = "done";
+					await writeRalphState(state);
+					finishLoop(ctx, "done");
+					ctx.ui.notify(`Plan "${state.planTitle}" complete — ${pass} passed, rest blocked/skipped.`, "success");
+					return;
+				}
+				state.currentStep = nextIndex;
+				state.steps[nextIndex].status = "in_progress";
+				next = "implement";
+				break;
 			}
 			// Else: go to the FIX phase (implement model).
 			ctx.ui.notify(`Step ${step.index + 1} "${step.title}" — FAILED (attempt ${step.retries}/${state.maxVerifyRetries}). Moving to the fix phase.`, "warning");
-			await goToPhase(ctx, "fix");
-			return;
+			await appendAutoProgressNote(state, `FAILED (attempt ${step.retries}/${state.maxVerifyRetries}) — moving to fix phase.`);
+			next = "fix";
+			break;
 		}
 
 		// ── Already done/stopped ──
@@ -868,35 +996,16 @@ async function advanceLoop(ctx: ExtensionContext): Promise<void> {
 			return;
 		}
 	}
-}
 
-/**
- * Move to the next pending step, or finish the whole plan.
- */
-async function nextStepOrFinish(ctx: ExtensionContext): Promise<void> {
-	const state = ralphState;
-	if (!state) return;
-	const nextIndex = state.currentStep + 1;
-	if (nextIndex >= state.steps.length) {
-		const pass = state.steps.filter((s) => s.status === "pass").length;
-		const blocked = state.steps.filter((s) => s.status === "blocked").length;
-		const skipped = state.steps.filter((s) => s.status === "skipped").length;
-		state.phase = "done";
-		await writeRalphState(state);
-		finishLoop(ctx, "done");
-		ctx.ui.notify(`Plan "${state.planTitle}" complete — ${pass} passed, ${blocked} blocked, ${skipped} skipped.`, "success");
-		return;
-	}
-	// Advance to the next step.
-	state.currentStep = nextIndex;
-	state.steps[nextIndex].status = "in_progress";
-	await writeRalphState(state);
-	await goToPhase(ctx, "implement");
+	if (!next) { finishLoop(ctx, "done"); return; }
+	state.phase = next;
+	await dispatchToNextPhase(ctx, state);
 }
 
 function finishLoop(ctx: ExtensionContext | undefined, reason: "done" | "stopped"): void {
 	if (!ctx) return;
 	ralphActive = false;
+	implementMode = false;
 	loopInFlight = false;
 	if (ralphState) {
 		ralphState.phase = reason === "stopped" ? "stopped" : "done";
@@ -913,7 +1022,7 @@ function finishLoop(ctx: ExtensionContext | undefined, reason: "done" | "stopped
    /implement entry — start or resume a Ralph loop
    ───────────────────────────────────────────────────── */
 
-async function startRalphLoop(cwd: string, planFilePath: string, ctx: ExtensionContext, opts?: { resume?: boolean }): Promise<void> {
+async function startRalphLoop(cwd: string, planFilePath: string, ctx: ExtensionContext, opts?: { resume?: boolean; fresh?: boolean }): Promise<void> {
 	// 1. Read and parse the plan.
 	let planText: string;
 	try {
@@ -944,36 +1053,34 @@ async function startRalphLoop(cwd: string, planFilePath: string, ctx: ExtensionC
 	const implementModel = modelKey(ctx.model) || "(current)";
 	let verifierModel = implementModel;
 
-	if (opts?.resume) {
-			// Resume existing state if present.
+	// Resume automatically whenever an incomplete state exists for this plan —
+	// regardless of how /implement was invoked (--resume, plan file arg, or picker).
+	// Without this, quitting pi and re-running /implement would restart from step 1
+	// even though earlier steps were already completed and checked off.
+	// Pass { fresh: true } to force a brand-new run from step 1.
+	if (!opts?.fresh) {
 		const existing = await readRalphState(cwd, planFilePath);
 		if (existing && existing.phase !== "done") {
+			// Reconcile with the checkboxes in the plan file itself: they are the most
+			// visible source of truth for the user, so trust them over possibly-stale
+			// persisted statuses. Then advance currentStep past any completed steps.
+			syncStepsFromPlanCheckboxes(existing, planText);
 			ralphState = existing;
-			ralphState.currentStep = clampCurrentStep(existing);
+			// Point currentStep at the first step that isn't finished, then clamp.
+			const firstUnfinished = ralphState.steps.findIndex((s) => s.status === "pending" || s.status === "in_progress");
+			ralphState.currentStep = firstUnfinished >= 0 ? firstUnfinished : clampCurrentStep(ralphState);
 			ralphActive = true;
+			implementMode = true;
+			// Re-hydrate the loop and make our tools active — the fresh
+			// phase session must be able to call them immediately.
+			ensureOwnToolsActive();
 			ralphState.stopped = false; // a resumed loop is active again
-			const resumeStep = ralphState.steps[ralphState.currentStep];
-			const resumePrompt =
-					ralphState.phase === "verify"
-						? buildVerifyPrompt(ralphState, resumeStep, true)
-						: ralphState.phase === "fix"
-							? buildFixPrompt(ralphState, resumeStep)
-							: buildImplementPrompt(ralphState, resumeStep);
 			ctx.ui.notify(`Resuming loop: ${planTitle} (step ${ralphState.currentStep + 1}/${ralphState.steps.length}, phase ${ralphState.phase}).`, "info");
 			updateProgress(ctx);
-			// Switch to the model for the resumed phase so a mid-verify resume
-			// uses the verifier, not the default implement model.
-			const resumeModelQuery =
-				ralphState.phase === "verify"
-					? (resumeStep?.verifyWith || ralphState.verifierModel)
-					: ralphState.implementModel;
-			const resumeTarget = findModelByQuery(ctx, resumeModelQuery);
-			if (resumeTarget && resumeTarget !== ctx.model) {
-				await P().setModel(resumeTarget);
-			}
-			// Send a prompt to actually resume the interrupted phase — without this the
-			// loop would sit idle, since there is no run in progress to trigger agent_settled.
-			P().sendUserMessage(resumePrompt);
+			// The interrupted phase re-runs in a FRESH session with a clean context.
+			// `pendingPrompt` tells that session's session_start to switch models and
+			// dispatch the phase prompt (notes inlined) — never an inline, polluted send.
+			await kickLoopSession(ctx, ralphState);
 			return;
 		}
 	}
@@ -1021,18 +1128,55 @@ async function startRalphLoop(cwd: string, planFilePath: string, ctx: ExtensionC
 		verifierModel,
 		maxVerifyRetries: settings.maxVerifyRetries,
 		stopped: false,
+		pendingPrompt: true,
 		steps: steps.map((s) => ({ ...s, status: "pending", retries: 0, noVerdictRetries: 0, lastVerdict: null, memory: "" })),
 	};
 	ralphState = state;
 	ralphState.steps[0].status = "in_progress";
 	await writeRalphState(state);
 	ralphActive = true;
+	implementMode = true;
+	// The loop is running — register our tools (idempotent) and make
+	// them active so the phase sessions can call them.
+	ensureOwnToolsActive();
 
-	// 6. Send the first implement prompt.
-	const firstPrompt = buildImplementPrompt(state, state.steps[0]);
+	// 6. Fresh run: reset the notes scratchpad, then dispatch step 1 of the loop
+	//    (fresh session, notes inlined) so even the first phase is clean.
+	await resetNotes(cwd, planFilePath, planTitle);
 	ctx.ui.notify(`Starting Ralph loop: ${planTitle} (${state.steps.length} steps, verifier ${verifierModel}).`, "info");
 	updateProgress(ctx);
-	P().sendUserMessage(firstPrompt);
+	await kickLoopSession(ctx, ralphState);
+}
+
+/**
+ * Dispatch the loop's current phase in a FRESH session (so the phase never sees the
+ * previous phase's turns). The fresh session's `session_start` reads the persisted
+ * `pendingPrompt` and performs the model switch + prompt send. Falls back to an
+ * inline dispatch in the current session when a hop isn't possible (non-command
+ * context or newSession failure).
+ */
+async function kickLoopSession(ctx: ExtensionContext, state: RalphState): Promise<void> {
+	state.pendingPrompt = true;
+	await writeRalphState(state);
+	const cmdCtx = ctx as ExtensionCommandContext;
+	if (typeof cmdCtx.newSession === "function") {
+		try {
+			let parent: string | undefined;
+			try { parent = ctx.sessionManager?.getSessionFile() ?? undefined; } catch { parent = undefined; }
+			const res = await cmdCtx.newSession({ parentSession: parent, withSession: async () => {} });
+			if (res && res.cancelled) throw new Error("session switch cancelled");
+			return;
+		} catch (e) {
+			ctx.ui.notify(`Could not open a fresh loop session (${(e as Error).message}). Dispatching in this session.`, "warning");
+		}
+	}
+	// No session hop: dispatch inline (the current session's context is not isolated,
+	// but the loop still runs and still never compacts).
+	await selectModelForPhase(ctx, state.phase, state);
+	const prompt = await buildPhasePrompt(state, state.phase);
+	state.pendingPrompt = false;
+	await writeRalphState(state);
+	P().sendUserMessage(prompt);
 }
 
 /** If a state was mid-step, make sure currentStep points at a real in-progress step. */
@@ -1042,12 +1186,55 @@ function clampCurrentStep(state: RalphState): number {
 	return state.currentStep;
 }
 
+/**
+ * Reconcile each persisted step's status with the checkbox marks in the plan file
+ * itself (source of truth the user can see), then set currentStep to the first
+ * unfinished step. Handles two scenarios:
+ *   - JSON state exists and is ahead of the plan checkboxes (should not happen, but
+ *     safe): we trust the checkboxes so we don't skip work the user sees as undone.
+ *   - Boxes are checked but a step is still recorded pending: re-mark it pass.
+ * Only the plan's checkbox style (`- [x] Step N:`) and the legacy heading marker
+ * are consulted; anything not marked done is treated as unfinished.
+ */
+function syncStepsFromPlanCheckboxes(state: RalphState, planText: string): void {
+	const lines = planText.split("\n");
+	const marks = new Map<number, string>(); // 1-based step number -> checkbox char
+	for (const line of lines) {
+		const cb = line.match(/^\s*-\s+\[([ xXB~])\]\s*[*_]{0,3}\s*Step\s+(\d+)[:.)]?\s*/i);
+		if (cb) {
+			const idx = parseInt(cb[2], 10);
+			marks.set(idx, cb[1].toLowerCase());
+		}
+		// legacy: ### Step N: ... [STATUS]
+		const hd = line.match(/^###\s+[*_]{0,3}\s*Step\s+(\d+)[:.)]\s*[*_]{0,3}\s*(?:.+?)\s+\[([A-Z]+)\]$/i);
+		if (hd) {
+			const idx = parseInt(hd[1], 10);
+			marks.set(idx, hd[2] === "DONE" ? "x" : hd[2] === "BLOCKED" ? "b" : hd[2] === "SKIPPED" ? "~" : " ");
+		}
+	}
+	let firstUnfinished = -1;
+	state.steps.forEach((s) => {
+		const num = s.index + 1;
+		if (marks.has(num)) {
+			const mark = marks.get(num)!;
+			if (mark === "x") s.status = "pass";
+			else if (mark === "b") s.status = "blocked";
+			else if (mark === "~") s.status = "skipped";
+			else if (mark === " " && s.status === "pass") s.status = "pending"; // uncross a stale pass
+		}
+		if (s.status === "pass" || s.status === "blocked" || s.status === "skipped") return;
+		if (firstUnfinished < 0) firstUnfinished = s.index;
+	});
+	if (firstUnfinished >= 0) state.currentStep = firstUnfinished;
+	else if (state.steps.every((s) => s.status === "pass" || s.status === "blocked" || s.status === "skipped")) state.phase = "done";
+}
+
 /* ─────────────────────────────────────────────────────
    Extension entry
    ───────────────────────────────────────────────────── */
 
 export default function (pi: ExtensionAPI) {
-	// Assign the live ExtensionAPI so module-level helpers (goToPhase,
+	// Assign the live ExtensionAPI so module-level helpers (kickLoopSession,
 	// startRalphLoop) can reach it through P().
 	__pi = pi;
 
@@ -1060,6 +1247,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			planDescription = args.trim();
+			// Register the loop tools now that /plan is running, and activate them.
+			ensureOwnToolsActive();
 			planMode = true;
 			ctx.ui.setStatus("plan-wizard", ctx.ui.theme.fg("warning", "planning…"));
 			const scopedMessage = `[Planning mode — do NOT implement. Use /implement later.]\n\n${planDescription}`;
@@ -1068,7 +1257,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	/* ── present_plan tool ───────────────────────────────── */
-	pi.registerTool({
+	addLazyTool({
 		name: "present_plan",
 		label: "Present Plan for Review",
 		description:
@@ -1225,8 +1414,28 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	/* ── /pw-next (internal) — advance the loop into a fresh session ── */
+	pi.registerCommand("pw-next", {
+		description: "(internal) Advance the Ralph loop to a fresh session for the next phase.",
+		handler: async (_args, ctx) => {
+			// Re-hydrate from the persisted state (session hops reset module globals).
+			const state = ralphState ?? (await findActiveState(ctx.cwd));
+			if (!state) return;
+			ralphState = state;
+			ralphActive = true;
+			if (state.stopped || state.phase === "done" || state.phase === "stopped") {
+				finishLoop(ctx, state.stopped || state.phase === "stopped" ? "stopped" : "done");
+				return;
+			}
+			// Register the loop tools (idempotent) and activate them for the
+			// fresh phase session that kickLoopSession is about to open.
+			ensureOwnToolsActive();
+			await kickLoopSession(ctx, state);
+		},
+	});
+
 	/* ── submit_verification tool ────────────────────────── */
-	pi.registerTool({
+	addLazyTool({
 		name: "submit_verification",
 		label: "Submit Verification Verdict",
 		description:
@@ -1265,6 +1474,15 @@ export default function (pi: ExtensionAPI) {
 			} catch (e) {
 				ctx.ui.notify(`Warning: could not persist verdict: ${(e as Error).message}`, "warning");
 			}
+			// Also append the verdict + carry-forward note into the shared scratchpad so
+			// the NEXT fresh phase (and any human reader) sees it without the compaction.
+			try {
+				const lines = [`Verdict: ${params.pass ? "PASS ✅" : "FAIL ❌"} (${params.issues.length} issue(s))`];
+				if (params.carryForwardNotes) lines.push(`Carry-forward for next step: ${params.carryForwardNotes}`);
+				await appendNote(ralphState.cwd, ralphState.planFile, `Step ${step.index + 1} verify`, lines.join("\n"));
+			} catch (e) {
+				ctx.ui.notify(`Warning: could not append verification note: ${(e as Error).message}`, "warning");
+			}
 			const summary = params.pass
 				? "PASS ✅"
 				: `FAIL ❌ (${params.issues.length} issue(s))`;
@@ -1292,6 +1510,47 @@ export default function (pi: ExtensionAPI) {
 			const msg = result.content[0]?.text ?? "";
 			const pass = msg.includes("PASS");
 			return new Text(theme.fg(pass ? "success" : "error", pass ? "Verdict: PASS ✅" : "Verdict: FAIL ❌"), 0, 0);
+		},
+	});
+
+	/* ── append_plan_note tool — agents jot design decisions into the scratchpad ── */
+	addLazyTool({
+		name: "append_plan_note",
+		label: "Append Plan Note",
+		description:
+			"Append a note to the shared implementation notes scratchpad (.pi/implement/<plan>.notes.md). " +
+			"Use this in ANY phase (implement/fix/verify) to record design decisions, file/function facts, " +
+			"or anything the NEXT phase's fresh context must know. Append-only — never rewrite existing entries.",
+		parameters: appendPlanNoteSchema,
+		async execute(_toolCallId, params: AppendPlanNoteParams, _signal, _onUpdate, ctx) {
+			if (!ralphActive || !ralphState) {
+				return {
+					content: [{ type: "text", text: "No active Ralph loop — append_plan_note is only usable inside /implement." }],
+					details: {} as Record<string, never>,
+				};
+			}
+			const step = ralphState.steps[ralphState.currentStep];
+			const stepNum = params.step ?? (step ? step.index + 1 : ralphState.currentStep + 1);
+			try {
+				await appendNote(ralphState.cwd, ralphState.planFile, `Step ${stepNum} ${ralphState.phase}`, `- ${params.text.trim()}`);
+				return {
+					content: [{ type: "text", text: `Note appended for Step ${stepNum} (phase ${ralphState.phase}).` }],
+					details: {} as Record<string, never>,
+				};
+			} catch (e) {
+				return {
+					content: [{ type: "text", text: `Failed to append note: ${(e as Error).message}` }],
+					details: {} as Record<string, never>,
+				};
+			}
+		},
+		renderCall(_args, theme) {
+			return new Text(theme.fg("toolTitle", theme.bold("append_plan_note ")) + theme.fg("muted", "jotting a note into the plan scratchpad…"), 0, 0);
+		},
+		renderResult(result, _opts, theme) {
+			const msg = result.content[0]?.text ?? "";
+			const ok = msg.startsWith("Note appended");
+			return new Text(theme.fg(ok ? "success" : "error", ok ? "Note saved" : "Note failed"), 0, 0);
 		},
 	});
 
@@ -1370,6 +1629,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	/* ── lazy tool registration ─────────────────────────── */
+	// Tools are registered + deactivated in the session_start handler below.
+	// We cannot call getAllTools()/getActiveTools()/setActiveTools() here
+	// because the runtime is not yet bound during extension load.
+	// (registerTool() IS valid here, but the idempotency check in
+	// registerLazyTools() needs getAllTools, so we defer to session_start.)
+
 	/* ── before_agent_start (plan mode only) ─────────────── */
 	pi.on("before_agent_start", async (_event, ctx) => {
 		// Clear stale status if neither mode is active.
@@ -1427,40 +1693,48 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	/* ── session_start — resume an incomplete loop ───────── */
-	pi.on("session_start", async (_event, ctx) => {
-		// Scan for the most recent incomplete (non-stopped, non-done) loop and resume it.
-		const dir = getImplementDir(ctx.cwd);
-		try {
-			const entries = await fs.promises.readdir(dir);
-			let latest: RalphState | null = null;
-			let latestMtime = 0;
-			for (const e of entries) {
-				if (!e.endsWith(".json")) continue;
-				const p = path.join(dir, e);
-				try {
-					const c = await fs.promises.readFile(p, "utf-8");
-					const s = JSON.parse(c) as RalphState;
-					if (!s || !Array.isArray(s.steps)) continue;
-					if (s.phase === "done") continue;
-					const st = await fs.promises.stat(p);
-					if (st.mtimeMs > latestMtime) {
-						latestMtime = st.mtimeMs;
-						latest = s;
-					}
-				} catch {
-					/* ignore */
-				}
-			}
-			if (latest) {
-					// Peek only — do NOT auto-resume. Auto-resume would set ralphActive
-					// without sending a prompt, leaving the loop visibly "stuck". The
-					// user resumes explicitly with /implement --resume.
-					const cs = clampCurrentStep(latest);
-					ctx.ui.notify(`An incomplete Ralph loop exists: "${latest.planTitle}" (step ${cs + 1}/${latest.steps.length}, phase ${latest.phase}). Run "/implement --resume" to continue it.`, "info");
-			}
-		} catch {
-			/* no implement dir yet */
+	/* ── session_start — dispatch / resume an in-flight Ralph loop ── */
+	pi.on("session_start", async (event, ctx) => {
+		// Every session must start with our tools registered but INACTIVE, so they
+		// don't leak into the system prompt of a plain coding session. A /plan or
+		// /implement command (or the pendingPrompt dispatch below) will reactivate
+		// them when the user actually starts a workflow.
+		registerLazyTools();
+		deactivateOwnTools();
+
+		// Re-hydrate the loop from the persisted state: session hops (newSession for a
+		// fresh phase) reset extension globals, so the JSON state is the source of truth
+		// every time a session starts.
+		const active = await findActiveState(ctx.cwd);
+		if (!active) return;
+
+		ralphState = active;
+		ralphState.currentStep = clampCurrentStep(active);
+
+		if (event.reason === "new" && active.pendingPrompt && !active.stopped) {
+			// The loop just opened this fresh session (via /implement or /pw-next):
+			// dispatch the phase immediately — switch to the phase's model and send the
+			// minimal prompt with the notes file inlined. No compaction, no leftovers.
+			ralphActive = true;
+			implementMode = true;
+			await selectModelForPhase(ctx, active.phase, active);
+			const prompt = await buildPhasePrompt(active, active.phase);
+			active.pendingPrompt = false;
+			try {
+				await writeRalphState(active);
+			} catch { /* non-fatal */ }
+			ctx.ui.setStatus("plan-wizard", ctx.ui.theme.fg("accent", `⟳ ${active.phase}`));
+			updateProgress(ctx);
+			P().sendUserMessage(prompt);
+			return;
+		}
+
+		// Genuinely interrupted loop (crash / stopped mid-phase): tell the user how to
+		// resume. Internal phase hops always carry pendingPrompt + reason "new", so they
+		// never land here and never spam this hint.
+		if (active.phase !== "done" && active.phase !== "stopped") {
+			const cs = clampCurrentStep(active);
+			ctx.ui.notify(`An incomplete Ralph loop exists: "${active.planTitle}" (step ${cs + 1}/${active.steps.length}, phase ${active.phase}). Run "/implement --resume" to continue it.`, "info");
 		}
 	});
 

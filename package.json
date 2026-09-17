@@ -1,7 +1,7 @@
 {
   "name": "pi-plan-wizard",
-  "description": "Plan and implement projects. Use /plan to create plans, /implement to execute them with step tracking, blocked-step handling, and auto-compaction.",
-  "version": "2.0.0",
+  "description": "Plan and implement projects. Use /plan to create plans, /implement to execute them as a step-tracking loop with per-phase fresh sessions, a shared notes scratchpad, blocked-step handling, and no context compaction.",
+  "version": "3.0.0",
   "type": "module",
   "keywords": ["pi-package"],
   "peerDependencies": {
